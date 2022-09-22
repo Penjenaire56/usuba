@@ -54,23 +54,6 @@ module Uexpr = struct
     }
 end
 
-let equiv_class exp union =
-  let equi =
-    Uexpr.HSet.filter
-      (fun x ->
-        Hash_union.PUnion.equiv union.Uexpr.union x.Hash_union.tag
-          exp.Hash_union.tag)
-      union.Uexpr.exprs
-  in
-  failwith "equiv_class"
-(*
-  let rec aux = function
-  | Tuple [e] -> Uexpr.HSet.map (fun x -> Tuple [x]) (aux e.Hash_union.node
-  )
-  | Tuple [e1;e2] -> Uexpr.HSet.map (fun y -> (Uexpr.HSet.map (fun x -> Tuple [y;x]) (aux e2.Hash_union.node))) (aux e1.Hash_union.node)
-  | _ -> assert false
-*)
-
 type deq_i = Eqn of Usuba_AST.var list * expr * bool
 (*| Loop of {
       id : ident;
@@ -91,6 +74,95 @@ type def = {
   opt : Usuba_AST.def_opt list;
   node : def_i;
 }
+
+let equiv_class (deqs : deq list) union =
+  let equi e =
+    Uexpr.HSet.filter
+      (fun x ->
+        Hash_union.PUnion.equiv union.Uexpr.union x.Hash_union.tag
+          e.Hash_union.tag)
+      union.Uexpr.exprs
+  in
+
+  let find_var exp excluded acc =
+    let eq = equi exp in
+    Uexpr.HSet.filter
+      (fun x ->
+        match (x.node, excluded) with
+        | ExpVar _, None -> true
+        | ExpVar v1, Some v2 -> v1 <> v2
+        | _ -> false)
+      eq
+  in
+
+  let find_best e var_eq acc =
+    match
+      Uexpr.HSet.filter (fun v -> Uexpr.HSet.mem v acc) var_eq
+      |> Uexpr.HSet.elements
+    with
+    | [] ->
+        let v = Uexpr.HSet.choose var_eq in
+        (v, Uexpr.HSet.add v acc)
+    | [ v ] -> (v, acc)
+    | _ -> assert false
+  in
+
+  let replace_best e acc excluded =
+    let eq = find_var e excluded acc in
+    if Uexpr.HSet.is_empty eq then (e, acc) else find_best e eq acc
+  in
+
+  let rec replace_by_var union (exp : Hash_expr.t Hash_union.hash_consed) acc
+      excluded =
+    match exp.node with
+    | ExpVar _ -> (exp, acc)
+    | Const _ -> (exp, acc)
+    | Not e ->
+        let e, acc = replace_by_var union e acc excluded in
+        let e, acc = replace_best e acc excluded in
+        (Hexpr.hashcons table (Not e), acc)
+    | Arith (op, e1, e2) ->
+        let e1, acc = replace_by_var union e1 acc excluded in
+        let e1, acc = replace_best e1 acc excluded in
+        let e2, acc = replace_by_var union e2 acc excluded in
+        let e2, acc = replace_best e2 acc excluded in
+        let e = Hexpr.hashcons table (Arith (op, e1, e2)) in
+        replace_best e acc excluded
+    | _ -> failwith ""
+    (*
+      | Log of Usuba_AST.log_op * expr * expr
+      | Arith of Usuba_AST.arith_op * expr * expr
+      | Shift of Usuba_AST.shift_op * expr * Usuba_AST.arith_expr *)
+  in
+
+  let used x acc =
+    not
+      (Uexpr.HSet.for_all
+         (fun e -> match e.node with ExpVar e -> e <> x | _ -> true)
+         acc)
+  in
+
+  let rec aux_apply acc = function
+    | [] -> []
+    | ({ content = Eqn ([ x ], _, _); _ } as deq) :: subL when used x acc ->
+        deq :: aux_apply acc subL
+    | ({ content = Eqn ([ x ], e, b); _ } as deq) :: subL ->
+        let e, acc = replace_by_var union e acc (Some x) in
+        { deq with content = Eqn ([ x ], e, b) } :: aux_apply acc subL
+    | ({ content = Eqn (vl, e, b); _ } as deq) :: subL ->
+        let e, acc = replace_by_var union e acc None in
+        { deq with content = Eqn (vl, e, b) } :: aux_apply acc subL
+  in
+
+  aux_apply Uexpr.HSet.empty deqs
+
+(*
+    let rec aux = function
+    | Tuple [e] -> Uexpr.HSet.map (fun x -> Tuple [x]) (aux e.Hash_union.node
+    )
+    | Tuple [e1;e2] -> Uexpr.HSet.map (fun y -> (Uexpr.HSet.map (fun x -> Tuple [y;x]) (aux e2.Hash_union.node))) (aux e1.Hash_union.node)
+    | _ -> assert false
+  *)
 
 let rec ast_to_es e =
   let res =
@@ -174,31 +246,32 @@ let fold_def (def : Usuba_AST.def) : Usuba_AST.def =
              | _ -> u (* Tuple de variables *))
            deqs union
        in
-       assert (Uexpr.HSet.cardinal union.Uexpr.exprs > 0);
-       let cse u ({ content = Eqn (vl, e, b); _ } as deq) =
-         let r =
-           Uexpr.HSet.filter
-             (fun x ->
-               Format.printf "%a@." pp__expr x.node;
-               if
-                 not
-                   (Hash_union.PUnion.equiv u.Uexpr.union x.Hash_union.tag
-                      e.Hash_union.tag)
-               then false
-               else match x.Hash_union.node with ExpVar _ -> true | _ -> false)
-             u.Uexpr.exprs
+
+       (*let cse u ({ content = Eqn (vl, e, b); _ } as deq) =
+           { deq with content = Eqn (vl, e, b) }
+
+           let r =
+             Uexpr.HSet.filter
+               (fun x ->
+                 if
+                   not
+                     (Hash_union.PUnion.equiv u.Uexpr.union x.Hash_union.tag
+                        e.Hash_union.tag)
+                 then false
+                 else match x.Hash_union.node with ExpVar _ -> true | _ -> false)
+               u.Uexpr.exprs
+           in
+           match Uexpr.HSet.min_elt_opt r with
+           | None -> deq
+           | Some s -> (
+               match s.Hash_union.node with
+               | ExpVar n when not (List.mem n vl) ->
+                   { deq with content = Eqn (vl, s, b) }
+               | _ -> deq)
+
          in
-         match Uexpr.HSet.min_elt_opt r with
-         | None -> deq
-         | Some s -> (
-             match s.Hash_union.node with
-             | ExpVar n when not (List.mem n vl) ->
-                 { deq with content = Eqn (vl, s, b) }
-             | _ -> deq)
-       in
-
-       let n = Single (p, List.map (cse union) deqs) in
-
+       *)
+       let n = Single (p, equiv_class deqs union) in
        def_es_to_ast n);
   }
 
@@ -233,8 +306,9 @@ let%test_module "CSE" =
       let deq = mk_deq_i [ [ x ] = a + b; [ y ] = a + b; [ z ] = a - b ] in
       let def = ftest deq in
       let def = fold_def def in
+      Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
-      let deq' = mk_deq_i [ [ x ] = a + b; [ y ] = x; [ z ] = a - b ] in
+      let deq' = mk_deq_i [ [ x ] = y; [ y ] = a + b; [ z ] = a - b ] in
 
       let def' = ftest deq' in
       Usuba_AST.equal_def def def'
@@ -243,6 +317,7 @@ let%test_module "CSE" =
       let deq = mk_deq_i [ [ y ] = a + b; [ x ] = a + b; [ z ] = a - b ] in
       let def = ftest deq in
       let def = fold_def def in
+      Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
       let deq' = mk_deq_i [ [ y ] = x; [ x ] = a + b; [ z ] = a - b ] in
 
@@ -255,6 +330,7 @@ let%test_module "CSE" =
       in
       let def = ftest deq in
       let def = fold_def def in
+      Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
       let deq' = mk_deq_i [ [ x ] = a + b; [ y ] = d - x + e; [ z ] = a - b ] in
 
@@ -268,6 +344,19 @@ let%test_module "CSE" =
       Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
       let deq' = mk_deq_i [ [ x ] = a + b; [ y ] = z; [ z ] = x + e ] in
+
+      let def' = ftest deq' in
+      Usuba_AST.equal_def def def'
+
+    let%test "simple5" =
+      let deq =
+        mk_deq_i [ [ x ] = a + b; [ y ] = a + b + (a + b); [ z ] = x + x ]
+      in
+      let def = ftest deq in
+      let def = fold_def def in
+      Format.printf "%a@." Usuba_print.(pp_def ()) def;
+
+      let deq' = mk_deq_i [ [ x ] = a + b; [ y ] = z; [ z ] = x + x ] in
 
       let def' = ftest deq' in
       Usuba_AST.equal_def def def'
