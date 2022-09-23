@@ -76,56 +76,40 @@ type def = {
 }
 
 let equiv_class (deqs : deq list) union =
-  let equi e =
+  let equi_var e =
     Uexpr.HSet.filter
       (fun x ->
-        Hash_union.PUnion.equiv union.Uexpr.union x.Hash_union.tag
-          e.Hash_union.tag)
+        if
+          not
+            (Hash_union.PUnion.equiv union.Uexpr.union x.Hash_union.tag
+               e.Hash_union.tag)
+        then false
+        else match x.node with ExpVar _ -> true | _ -> false)
       union.Uexpr.exprs
   in
 
   let find_var exp excluded =
-    let eq = equi exp in
-    Uexpr.HSet.filter
-      (fun x ->
-        match (x.node, excluded) with
-        | ExpVar _, None -> true
-        | ExpVar v1, Some v2 -> v1 <> v2
-        | _ -> false)
-      eq
+    let eq = equi_var exp in
+    match Uexpr.HSet.min_elt_opt eq with
+    | None -> exp
+    | Some s -> (
+        match s.node with ExpVar n when List.mem n excluded -> exp | _ -> s)
   in
 
-  let find_best var_eq acc =
-    match
-      Uexpr.HSet.filter (fun v -> Uexpr.HSet.mem v acc) var_eq
-      |> Uexpr.HSet.elements
-    with
-    | [] ->
-        let v = Uexpr.HSet.choose var_eq in
-        (v, Uexpr.HSet.add v acc)
-    | [ v ] -> (v, acc)
-    | _ -> assert false
-  in
-
-  let replace_best e acc excluded =
-    let eq = find_var e excluded in
-    if Uexpr.HSet.is_empty eq then (e, acc) else find_best eq acc
-  in
-
-  let rec replace_by_var union (exp : Hash_expr.t Hash_union.hash_consed) acc
+  let rec replace_by_var union (exp : Hash_expr.t Hash_union.hash_consed)
       excluded =
     match exp.node with
-    | Const _ -> (exp, acc)
-    | ExpVar _ -> replace_best exp acc excluded
+    | Const _ -> exp
+    | ExpVar _ -> find_var exp excluded
     | Not e ->
-        let e, acc = replace_by_var union e acc excluded in
+        let e = replace_by_var union e excluded in
         let e = Hexpr.hashcons table (Not e) in
-        replace_best e acc excluded
+        find_var e excluded
     | Arith (op, e1, e2) ->
-        let e1, acc = replace_by_var union e1 acc excluded in
-        let e2, acc = replace_by_var union e2 acc excluded in
+        let e1 = replace_by_var union e1 excluded in
+        let e2 = replace_by_var union e2 excluded in
         let e = Hexpr.hashcons table (Arith (op, e1, e2)) in
-        replace_best e acc excluded
+        find_var e excluded
     | _ -> failwith "replace_by_var"
     (*
       | Log of Usuba_AST.log_op * expr * expr
@@ -133,26 +117,11 @@ let equiv_class (deqs : deq list) union =
       | Shift of Usuba_AST.shift_op * expr * Usuba_AST.arith_expr *)
   in
 
-  let used x acc =
-    not
-      (Uexpr.HSet.for_all
-         (fun e -> match e.node with ExpVar e -> e <> x | _ -> true)
-         acc)
-  in
-
-  let rec aux_apply acc = function
-    | [] -> []
-    | ({ content = Eqn ([ x ], _, _); _ } as deq) :: subL when used x acc ->
-        deq :: aux_apply acc subL
-    | ({ content = Eqn ([ x ], e, b); _ } as deq) :: subL ->
-        let e, acc = replace_by_var union e acc (Some x) in
-        { deq with content = Eqn ([ x ], e, b) } :: aux_apply acc subL
-    | ({ content = Eqn (vl, e, b); _ } as deq) :: subL ->
-        let e, acc = replace_by_var union e acc None in
-        { deq with content = Eqn (vl, e, b) } :: aux_apply acc subL
-  in
-
-  aux_apply Uexpr.HSet.empty deqs
+  List.map
+    (fun ({ content = Eqn (vl, e, b); _ } as deq) ->
+      let e = replace_by_var union e vl in
+      { deq with content = Eqn (vl, e, b) })
+    deqs
 
 (*
     let rec aux = function
@@ -306,10 +275,13 @@ let%test_module "CSE" =
       let def = fold_def def in
       Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
-      let deq' = mk_deq_i [ [ x ] = y; [ y ] = a + b; [ z ] = a - b ] in
+      let deq1 = mk_deq_i [ [ x ] = a + b; [ y ] = x; [ z ] = a - b ] in
+      let def1 = ftest deq1 in
 
-      let def' = ftest deq' in
-      Usuba_AST.equal_def def def'
+      let deq2 = mk_deq_i [ [ x ] = y; [ y ] = a + b; [ z ] = a - b ] in
+      let def2 = ftest deq2 in
+
+      Usuba_AST.equal_def def def1 || Usuba_AST.equal_def def def2
 
     let%test "simple2" =
       let deq = mk_deq_i [ [ y ] = a + b; [ x ] = a + b; [ z ] = a - b ] in
@@ -317,10 +289,13 @@ let%test_module "CSE" =
       let def = fold_def def in
       Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
-      let deq' = mk_deq_i [ [ y ] = x; [ x ] = a + b; [ z ] = a - b ] in
+      let deq1 = mk_deq_i [ [ y ] = x; [ x ] = a + b; [ z ] = a - b ] in
+      let def1 = ftest deq1 in
 
-      let def' = ftest deq' in
-      Usuba_AST.equal_def def def'
+      let deq2 = mk_deq_i [ [ x ] = a + b; [ y ] = x; [ z ] = a - b ] in
+      let def2 = ftest deq2 in
+
+      Usuba_AST.equal_def def def1 || Usuba_AST.equal_def def def2
 
     let%test "simple3" =
       let deq =
@@ -330,10 +305,10 @@ let%test_module "CSE" =
       let def = fold_def def in
       Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
-      let deq' = mk_deq_i [ [ x ] = a + b; [ y ] = d - x + e; [ z ] = a - b ] in
+      let deq1 = mk_deq_i [ [ x ] = a + b; [ y ] = d - x + e; [ z ] = a - b ] in
+      let def1 = ftest deq1 in
 
-      let def' = ftest deq' in
-      Usuba_AST.equal_def def def'
+      Usuba_AST.equal_def def def1
 
     let%test "simple4" =
       let deq = mk_deq_i [ [ x ] = a + b; [ y ] = a + b + e; [ z ] = x + e ] in
@@ -341,10 +316,10 @@ let%test_module "CSE" =
       let def = fold_def def in
       Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
-      let deq' = mk_deq_i [ [ x ] = a + b; [ y ] = z; [ z ] = x + e ] in
+      let deq1 = mk_deq_i [ [ x ] = a + b; [ y ] = z; [ z ] = x + e ] in
+      let def1 = ftest deq1 in
 
-      let def' = ftest deq' in
-      Usuba_AST.equal_def def def'
+      Usuba_AST.equal_def def def1
 
     (* Problème avec l'associativité des opérations *)
     let%test "simple5" =
@@ -391,8 +366,11 @@ let%test_module "CSE" =
       let def = fold_def def in
       Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
-      let deq' = mk_deq_i [ [ x ] = y; [ y ] = a + b; [ z ] = y ] in
+      let deq1 = mk_deq_i [ [ x ] = y; [ y ] = a + b; [ z ] = y ] in
+      let def1 = ftest deq1 in
 
-      let def' = ftest deq' in
-      Usuba_AST.equal_def def def'
+      let deq2 = mk_deq_i [ [ x ] = a + b; [ y ] = x; [ z ] = x ] in
+      let def2 = ftest deq2 in
+
+      Usuba_AST.equal_def def def1 || Usuba_AST.equal_def def def2
   end)
