@@ -131,28 +131,42 @@ let equiv_class (deqs : deq list) union =
     | _ -> assert false
   *)
 
-let rec ast_to_es e =
-  let res =
-    match e with
-    | Usuba_AST.Const (i, t) -> Hexpr.hashcons table (Const (i, t))
-    | Usuba_AST.ExpVar v -> Hexpr.hashcons table (ExpVar v)
-    | Usuba_AST.Tuple el -> Hexpr.hashcons table (Tuple (List.map ast_to_es el))
-    | Usuba_AST.Not e -> Hexpr.hashcons table (Not (ast_to_es e))
-    | Usuba_AST.Log (op, e1, e2) ->
-        Hexpr.hashcons table (Log (op, ast_to_es e1, ast_to_es e2))
-    | Usuba_AST.Arith (op, e1, e2) ->
-        Hexpr.hashcons table (Arith (op, ast_to_es e1, ast_to_es e2))
-    | Usuba_AST.Shift (op, e1, e2) ->
-        Hexpr.hashcons table (Shift (op, ast_to_es e1, e2))
-    (*| Shuffle (var, il) ->
-      | Bitmask (e, ae) ->
-      | Pack (e1, e2, o) ->
-      | Fun (id, el) ->
-      | Fun_v (id, ae, el) -> *)
-    | _ -> failwith "ast_to_es"
-  in
-  Format.eprintf "%a: %d@." Usuba_print.(pp_expr ()) e res.tag;
-  res
+let rec ast_to_es e union =
+  match e with
+  | Usuba_AST.Const (i, t) -> (Hexpr.hashcons table (Const (i, t)), union)
+  | Usuba_AST.ExpVar v -> (Hexpr.hashcons table (ExpVar v), union)
+  | Usuba_AST.Tuple el ->
+      let el, union =
+        List.fold_left
+          (fun (el, union) e ->
+            let e, union = ast_to_es e union in
+            (e :: el, union))
+          ([], union) el
+      in
+      (Hexpr.hashcons table (Tuple el), union)
+  | Usuba_AST.Not e ->
+      let e, union = ast_to_es e union in
+      (Hexpr.hashcons table (Not e), union)
+  | Usuba_AST.Log (op, e1, e2) ->
+      let e1, union = ast_to_es e1 union in
+      let e2, union = ast_to_es e2 union in
+      (Hexpr.hashcons table (Log (op, e1, e2)), union)
+  | Usuba_AST.Arith (op, e1, e2) ->
+      let e1, union = ast_to_es e1 union in
+      let e2, union = ast_to_es e2 union in
+
+      let n1 = Hexpr.hashcons table (Arith (op, e1, e2)) in
+      let n2 = Hexpr.hashcons table (Arith (op, e2, e1)) in
+      (n1, Uexpr.union union n1 n2)
+  | Usuba_AST.Shift (op, e1, e2) ->
+      let e1, union = ast_to_es e1 union in
+      (Hexpr.hashcons table (Shift (op, e1, e2)), union)
+  (*| Shuffle (var, il) ->
+    | Bitmask (e, ae) ->
+    | Pack (e1, e2, o) ->
+    | Fun (id, el) ->
+    | Fun_v (id, ae, el) -> *)
+  | _ -> failwith "ast_to_es"
 
 let rec _es_to_ast = function
   | Const (i, t) -> Usuba_AST.Const (i, t)
@@ -165,19 +179,18 @@ let rec _es_to_ast = function
 
 and es_to_ast h = _es_to_ast h.node
 
-let eqAst_to_eqEs = function
+let eqAst_to_eqEs union = function
   | Usuba_AST.Eqn (v, e, b) ->
       List.iter (fun x -> ignore (Hexpr.hashcons table (ExpVar x))) v;
-      Eqn (v, ast_to_es e, b)
+      let e, u = ast_to_es e union in
+      (Eqn (v, e, b), u)
   | _ -> failwith "eqAst_to_eqEs"
 
 let eqEs_to_eqAst = function Eqn (v, e, b) -> Usuba_AST.Eqn (v, es_to_ast e, b)
 
-let deq_ast_to_es (v : Usuba_AST.deq) =
-  {
-    content = eqAst_to_eqEs v.content;
-    orig = List.map (fun (i, d) -> (i, eqAst_to_eqEs d)) v.orig;
-  }
+let deq_ast_to_es (v : Usuba_AST.deq) u =
+  let d, u = eqAst_to_eqEs u v.content in
+  ({ content = d; orig = [] }, u)
 
 let deq_es_to_ast (v : deq) : Usuba_AST.deq =
   {
@@ -185,12 +198,17 @@ let deq_es_to_ast (v : deq) : Usuba_AST.deq =
     orig = List.map (fun (i, d) -> (i, eqEs_to_eqAst d)) v.orig;
   }
 
-let fold_deqs (env_var : Usuba_AST.typ Ident.Hashtbl.t)
-    (deqs : Usuba_AST.deq list) : deq list =
-  List.map deq_ast_to_es deqs
+let fold_deqs (deqs : Usuba_AST.deq list) u =
+  List.fold_left
+    (fun (u, acc) d ->
+      let d', u = deq_ast_to_es d u in
+      (u, d' :: acc))
+    (u, []) deqs
 
-let def_ast_to_es = function
-  | Usuba_AST.Single (p, dl) -> Single (p, List.map deq_ast_to_es dl)
+let def_ast_to_es u = function
+  | Usuba_AST.Single (p, dl) ->
+      let u, dl' = fold_deqs dl u in
+      (u, Single (p, dl'))
   | _ -> failwith "def_ast_to_es"
 
 let def_es_to_ast = function
@@ -200,10 +218,32 @@ let fold_def (def : Usuba_AST.def) : Usuba_AST.def =
   {
     def with
     Usuba_AST.node =
-      (let (Single (p, deqs)) = def_ast_to_es def.node in
-       let nb = Array.length table.Hexpr.table in
-
+      (let nb = 42000 in
        let union = Uexpr.create nb in
+
+       (* let union, e1, e2 =
+            let open Syntax in
+            let a = v "a" in
+            let b = v "b" in
+            let a, union = ast_to_es a union in
+            let b, union = ast_to_es b union in
+
+            let e1 = Arith (Usuba_AST.Add, a, b) in
+            let e2 = Arith (Usuba_AST.Add, b, a) in
+            (union, e1, e2)
+          in
+
+          let e1 = Hexpr.hashcons table e1 in
+          let e2 = Hexpr.hashcons table e2 in
+
+          let union = Uexpr.union union e1 e2 in
+
+          assert (
+            Hash_union.PUnion.equiv union.Uexpr.union e1.Hash_union.tag
+              e2.Hash_union.tag);
+       *)
+       let union, Single (p, deqs) = def_ast_to_es union def.node in
+       let deqs = List.rev deqs in
        let union =
          List.fold_right
            (fun e u ->
@@ -355,10 +395,13 @@ let%test_module "CSE" =
       let def = fold_def def in
       Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
-      let deq' = mk_deq_i [ [ x ] = y; [ y ] = b + a; [ z ] = a - b ] in
+      let deq1 = mk_deq_i [ [ x ] = y; [ y ] = b + a; [ z ] = a - b ] in
+      let def1 = ftest deq1 in
 
-      let def' = ftest deq' in
-      Usuba_AST.equal_def def def'
+      let deq2 = mk_deq_i [ [ x ] = a + b; [ y ] = x; [ z ] = a - b ] in
+      let def2 = ftest deq2 in
+
+      Usuba_AST.equal_def def def1 || Usuba_AST.equal_def def def2
 
     let%test "simple8" =
       let deq = mk_deq_i [ [ x ] = a + b; [ y ] = a + b; [ z ] = x ] in
