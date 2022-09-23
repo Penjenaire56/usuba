@@ -84,7 +84,7 @@ let equiv_class (deqs : deq list) union =
       union.Uexpr.exprs
   in
 
-  let find_var exp excluded acc =
+  let find_var exp excluded =
     let eq = equi exp in
     Uexpr.HSet.filter
       (fun x ->
@@ -95,7 +95,7 @@ let equiv_class (deqs : deq list) union =
       eq
   in
 
-  let find_best e var_eq acc =
+  let find_best var_eq acc =
     match
       Uexpr.HSet.filter (fun v -> Uexpr.HSet.mem v acc) var_eq
       |> Uexpr.HSet.elements
@@ -108,27 +108,25 @@ let equiv_class (deqs : deq list) union =
   in
 
   let replace_best e acc excluded =
-    let eq = find_var e excluded acc in
-    if Uexpr.HSet.is_empty eq then (e, acc) else find_best e eq acc
+    let eq = find_var e excluded in
+    if Uexpr.HSet.is_empty eq then (e, acc) else find_best eq acc
   in
 
   let rec replace_by_var union (exp : Hash_expr.t Hash_union.hash_consed) acc
       excluded =
     match exp.node with
-    | ExpVar _ -> (exp, acc)
     | Const _ -> (exp, acc)
+    | ExpVar _ -> replace_best exp acc excluded
     | Not e ->
         let e, acc = replace_by_var union e acc excluded in
-        let e, acc = replace_best e acc excluded in
-        (Hexpr.hashcons table (Not e), acc)
+        let e = Hexpr.hashcons table (Not e) in
+        replace_best e acc excluded
     | Arith (op, e1, e2) ->
         let e1, acc = replace_by_var union e1 acc excluded in
-        let e1, acc = replace_best e1 acc excluded in
         let e2, acc = replace_by_var union e2 acc excluded in
-        let e2, acc = replace_best e2 acc excluded in
         let e = Hexpr.hashcons table (Arith (op, e1, e2)) in
         replace_best e acc excluded
-    | _ -> failwith ""
+    | _ -> failwith "replace_by_var"
     (*
       | Log of Usuba_AST.log_op * expr * expr
       | Arith of Usuba_AST.arith_op * expr * expr
@@ -348,7 +346,21 @@ let%test_module "CSE" =
       let def' = ftest deq' in
       Usuba_AST.equal_def def def'
 
+    (* Problème avec l'associativité des opérations *)
     let%test "simple5" =
+      let deq =
+        mk_deq_i [ [ x ] = a + b; [ y ] = a + b + a + b; [ z ] = x + x ]
+      in
+      let def = ftest deq in
+      let def = fold_def def in
+      Format.printf "%a@." Usuba_print.(pp_def ()) def;
+
+      let deq' = mk_deq_i [ [ x ] = a + b; [ y ] = z; [ z ] = x + x ] in
+
+      let def' = ftest deq' in
+      Usuba_AST.equal_def def def'
+
+    let%test "simple6" =
       let deq =
         mk_deq_i [ [ x ] = a + b; [ y ] = a + b + (a + b); [ z ] = x + x ]
       in
@@ -357,6 +369,29 @@ let%test_module "CSE" =
       Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
       let deq' = mk_deq_i [ [ x ] = a + b; [ y ] = z; [ z ] = x + x ] in
+
+      let def' = ftest deq' in
+      Usuba_AST.equal_def def def'
+
+    (* Problème avec la communtativité des opérations *)
+    let%test "simple7" =
+      let deq = mk_deq_i [ [ x ] = a + b; [ y ] = b + a; [ z ] = a - b ] in
+      let def = ftest deq in
+      let def = fold_def def in
+      Format.printf "%a@." Usuba_print.(pp_def ()) def;
+
+      let deq' = mk_deq_i [ [ x ] = y; [ y ] = b + a; [ z ] = a - b ] in
+
+      let def' = ftest deq' in
+      Usuba_AST.equal_def def def'
+
+    let%test "simple8" =
+      let deq = mk_deq_i [ [ x ] = a + b; [ y ] = a + b; [ z ] = x ] in
+      let def = ftest deq in
+      let def = fold_def def in
+      Format.printf "%a@." Usuba_print.(pp_def ()) def;
+
+      let deq' = mk_deq_i [ [ x ] = y; [ y ] = a + b; [ z ] = y ] in
 
       let def' = ftest deq' in
       Usuba_AST.equal_def def def'
