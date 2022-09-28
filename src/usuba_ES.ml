@@ -75,8 +75,15 @@ type def = {
   node : def_i;
 }
 
+let equiv e union =
+  Uexpr.HSet.filter
+    (fun x ->
+      Hash_union.PUnion.equiv union.Uexpr.union x.Hash_union.tag
+        e.Hash_union.tag)
+    union.Uexpr.exprs
+
 let equiv_class (deqs : deq list) union =
-  let equi_var e =
+  let equi_var e union =
     Uexpr.HSet.filter
       (fun x ->
         if
@@ -88,8 +95,8 @@ let equiv_class (deqs : deq list) union =
       union.Uexpr.exprs
   in
 
-  let find_var exp excluded =
-    let eq = equi_var exp in
+  let find_var exp excluded union =
+    let eq = equi_var exp union in
     match Uexpr.HSet.min_elt_opt eq with
     | None -> exp
     | Some s -> (
@@ -100,16 +107,16 @@ let equiv_class (deqs : deq list) union =
       excluded =
     match exp.node with
     | Const _ -> exp
-    | ExpVar _ -> find_var exp excluded
+    | ExpVar _ -> find_var exp excluded union
     | Not e ->
         let e = replace_by_var union e excluded in
         let e = Hexpr.hashcons table (Not e) in
-        find_var e excluded
+        find_var e excluded union
     | Arith (op, e1, e2) ->
         let e1 = replace_by_var union e1 excluded in
         let e2 = replace_by_var union e2 excluded in
         let e = Hexpr.hashcons table (Arith (op, e1, e2)) in
-        find_var e excluded
+        find_var e excluded union
     | _ -> failwith "replace_by_var"
     (*
       | Log of Usuba_AST.log_op * expr * expr
@@ -156,8 +163,32 @@ let rec ast_to_es e union =
       let e2, union = ast_to_es e2 union in
 
       let n1 = Hexpr.hashcons table (Arith (op, e1, e2)) in
+
+      (* et union =
+           match (op, e2.node) with
+           | Usuba_AST.Add, Arith (Usuba_AST.Add, x1, x2) ->
+               let n2 =
+                 Hexpr.hashcons table
+                   (Arith
+                      (op, Hexpr.hashcons table (Arith (Usuba_AST.Add, e1, x1)), x2))
+               in
+               Uexpr.union union n1 n2
+           | _, _ -> union
+         in
+
+         let union =
+           match (op, e1.node) with
+           | Usuba_AST.Add, Arith (Usuba_AST.Add, x1, x2) ->
+               let n2 =
+                 Hexpr.hashcons table
+                   (Arith
+                      (op, x1, Hexpr.hashcons table (Arith (Usuba_AST.Add, x2, e2))))
+               in
+               Uexpr.union union n1 n2
+           | _, _ -> union
+         in *)
       let n2 = Hexpr.hashcons table (Arith (op, e2, e1)) in
-      (n1, Uexpr.union union n1 n2)
+      (n1, union (*Uexpr.union union n1 n2*))
   | Usuba_AST.Shift (op, e1, e2) ->
       let e1, union = ast_to_es e1 union in
       (Hexpr.hashcons table (Shift (op, e1, e2)), union)
@@ -253,31 +284,51 @@ let fold_def (def : Usuba_AST.def) : Usuba_AST.def =
              | _ -> u (* Tuple de variables *))
            deqs union
        in
+       let equality union =
+         let equality (x : expr) union =
+           match x.node with
+           | Arith (Usuba_AST.Add, a, b) -> (
+               let y = Hexpr.hashcons table (Arith (Usuba_AST.Add, b, a)) in
+               let union = Uexpr.union union x y in
 
-       (*let cse u ({ content = Eqn (vl, e, b); _ } as deq) =
-           { deq with content = Eqn (vl, e, b) }
-
-           let r =
-             Uexpr.HSet.filter
-               (fun x ->
-                 if
-                   not
-                     (Hash_union.PUnion.equiv u.Uexpr.union x.Hash_union.tag
-                        e.Hash_union.tag)
-                 then false
-                 else match x.Hash_union.node with ExpVar _ -> true | _ -> false)
-               u.Uexpr.exprs
-           in
-           match Uexpr.HSet.min_elt_opt r with
-           | None -> deq
-           | Some s -> (
-               match s.Hash_union.node with
-               | ExpVar n when not (List.mem n vl) ->
-                   { deq with content = Eqn (vl, s, b) }
-               | _ -> deq)
-
+               match a.node with
+               | Arith (Usuba_AST.Add, e, f) ->
+                   let a' =
+                     Hexpr.hashcons table (Arith (Usuba_AST.Add, f, b))
+                   in
+                   let n =
+                     Hexpr.hashcons table (Arith (Usuba_AST.Add, e, a'))
+                   in
+                   Uexpr.union union x n
+               | _ -> union)
+           | _ -> union
          in
-       *)
+         Uexpr.HSet.fold equality union.Uexpr.exprs union
+       in
+
+       let saturate union =
+         let saturate (x : expr) union =
+           match x.node with
+           | Arith (Usuba_AST.Add, a, b) ->
+               let eqa = equiv a union in
+               let eqb = equiv b union in
+
+               let satur a union =
+                 Uexpr.HSet.fold
+                   (fun b union ->
+                     Uexpr.union union x
+                       (Hexpr.hashcons table (Arith (Usuba_AST.Add, a, b))))
+                   eqb union
+               in
+               Uexpr.HSet.fold satur eqa union
+           | _ -> union
+         in
+         Uexpr.HSet.fold saturate union.Uexpr.exprs union
+       in
+
+       let union = equality union in
+       let union = saturate union in
+
        let n = Single (p, equiv_class deqs union) in
        def_es_to_ast n);
   }
@@ -383,10 +434,13 @@ let%test_module "CSE" =
       let def = fold_def def in
       Format.printf "%a@." Usuba_print.(pp_def ()) def;
 
-      let deq' = mk_deq_i [ [ x ] = a + b; [ y ] = z; [ z ] = x + x ] in
+      let deq1 = mk_deq_i [ [ x ] = a + b; [ y ] = x + x; [ z ] = y ] in
+      let def1 = ftest deq1 in
 
-      let def' = ftest deq' in
-      Usuba_AST.equal_def def def'
+      let deq2 = mk_deq_i [ [ x ] = a + b; [ y ] = z; [ z ] = x + x ] in
+      let def2 = ftest deq2 in
+
+      Usuba_AST.equal_def def def1 || Usuba_AST.equal_def def def2
 
     (* Problème avec la communtativité des opérations *)
     let%test "simple7" =
@@ -416,4 +470,20 @@ let%test_module "CSE" =
       let def2 = ftest deq2 in
 
       Usuba_AST.equal_def def def1 || Usuba_AST.equal_def def def2
+
+    let%test "simple9" =
+      let deq =
+        mk_deq_i
+          [ [ x ] = a + b; [ y ] = a + a + b; [ z ] = b + a; [ e ] = a + x ]
+      in
+      let def = ftest deq in
+      let def = fold_def def in
+      Format.printf "%a@." Usuba_print.(pp_def ()) def;
+
+      let deq' =
+        mk_deq_i [ [ x ] = a + b; [ y ] = e; [ z ] = x; [ e ] = a + x ]
+      in
+
+      let def' = ftest deq' in
+      Usuba_AST.equal_def def def'
   end)
